@@ -33,7 +33,7 @@ app.add_middleware(
 
 # Configuration
 SITE_AUTH_TOKEN = "YXBpLTEyMzQ1Ng=="  # Base64 encoded auth token
-DEFAULT_LLM_ENDPOINT = "https://127.0.0.1:8317/v1/chat/completions"
+DEFAULT_LLM_ENDPOINT = "http://127.0.0.1:8317/v1/chat/completions"
 DEFAULT_CACHE_TTL_DAYS = 7
 CACHE_TTL_CONFIG_KEY = "tl_config:cache_ttl_days"  # Redis key for TTL config
 LOG_DIR = Path("logs")

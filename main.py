@@ -228,11 +228,16 @@ async def chat_completions(request: Request):
     site_api = request.headers.get("site_api", request.headers.get("site-api", ""))
     authorization = request.headers.get("Authorization", "")
     
+    # 1b. Fallback: if site_auth is empty, try to extract from Authorization Bearer token
+    if not site_auth and authorization.startswith("Bearer "):
+        site_auth = authorization[7:]  # Remove "Bearer " prefix
+        print(f"[AUTH] Using Authorization Bearer as site_auth: '{site_auth}'")
+    
     # 2. Validate site_auth
     if site_auth != SITE_AUTH_TOKEN:
         print(f"[AUTH FAIL] Received site_auth: '{site_auth}'")
         print(f"[AUTH FAIL] Expected site_auth: '{SITE_AUTH_TOKEN}'")
-        print(f"[AUTH FAIL] Authorization header: '{authorization[:30]}...' (truncated)")
+        print(f"[AUTH FAIL] Authorization header: '{authorization[:50]}...' (truncated)")
         raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid site_auth. Received: '{site_auth}'")
     
     # 3. Determine target endpoint

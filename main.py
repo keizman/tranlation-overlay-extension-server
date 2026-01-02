@@ -230,7 +230,10 @@ async def chat_completions(request: Request):
     
     # 2. Validate site_auth
     if site_auth != SITE_AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid site_auth")
+        print(f"[AUTH FAIL] Received site_auth: '{site_auth}'")
+        print(f"[AUTH FAIL] Expected site_auth: '{SITE_AUTH_TOKEN}'")
+        print(f"[AUTH FAIL] Authorization header: '{authorization[:30]}...' (truncated)")
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid site_auth. Received: '{site_auth}'")
     
     # 3. Determine target endpoint
     target_url = site_api if site_api else DEFAULT_LLM_ENDPOINT

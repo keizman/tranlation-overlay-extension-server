@@ -224,24 +224,28 @@ async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint with caching."""
     
     # 1. Extract headers
+    # - Authorization: Bearer <server_api_key> - used to validate client request
+    # - site_auth: <llm_api_key> - used to authenticate with LLM
+    # - site_api: <llm_endpoint> - LLM endpoint URL
+    authorization = request.headers.get("Authorization", "")
     site_auth = request.headers.get("site_auth", request.headers.get("site-auth", ""))
     site_api = request.headers.get("site_api", request.headers.get("site-api", ""))
-    authorization = request.headers.get("Authorization", "")
     
-    # 1b. Fallback: if site_auth is empty, try to extract from Authorization Bearer token
-    if not site_auth and authorization.startswith("Bearer "):
-        site_auth = authorization[7:]  # Remove "Bearer " prefix
-        print(f"[AUTH] Using Authorization Bearer as site_auth: '{site_auth}'")
+    # 2. Validate client request using Authorization Bearer token
+    client_token = ""
+    if authorization.startswith("Bearer "):
+        client_token = authorization[7:]  # Remove "Bearer " prefix
     
-    # 2. Validate site_auth
-    if site_auth != SITE_AUTH_TOKEN:
-        print(f"[AUTH FAIL] Received site_auth: '{site_auth}'")
-        print(f"[AUTH FAIL] Expected site_auth: '{SITE_AUTH_TOKEN}'")
-        print(f"[AUTH FAIL] Authorization header: '{authorization[:50]}...' (truncated)")
-        raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid site_auth. Received: '{site_auth}'")
+    if client_token != SITE_AUTH_TOKEN:
+        print(f"[AUTH FAIL] Client token: '{client_token}'")
+        print(f"[AUTH FAIL] Expected: '{SITE_AUTH_TOKEN}'")
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid API key")
     
-    # 3. Determine target endpoint
+    print(f"[AUTH OK] Client authenticated, site_auth={'set' if site_auth else 'empty'}, site_api={site_api or 'default'}")
+    
+    # 3. Determine LLM endpoint and auth
     target_url = site_api if site_api else DEFAULT_LLM_ENDPOINT
+    llm_auth = site_auth if site_auth else client_token  # Fallback to client token if site_auth not provided
     
     # 4. Parse request body
     try:
@@ -273,10 +277,10 @@ async def chat_completions(request: Request):
                 if not content.startswith("/no-think"):
                     msg["content"] = "/no-think\n" + content
     
-    # 8. Forward request to LLM - use site_auth as Authorization
+    # 8. Forward request to LLM - use site_auth (LLM API key) for Authorization
     forward_headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {site_auth}",  # Use site_auth for LLM auth
+        "Authorization": f"Bearer {llm_auth}",  # Use LLM API key
     }
     
     try:

@@ -31,13 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-SITE_AUTH_TOKEN = "YXBpLTEyMzQ1Ng=="  # Base64 encoded auth token
-DEFAULT_LLM_ENDPOINT = "http://127.0.0.1:8317/v1/chat/completions"
-DEFAULT_CACHE_TTL_DAYS = 30
+# Configuration - read from environment variables with defaults
+SITE_AUTH_TOKEN = os.getenv("SITE_AUTH_TOKEN", "YXBpLTEyMzQ1Ng==")  # Client -> Server auth
+LLM_SITE_AUTH = os.getenv("LLM_SITE_AUTH", "")  # Server -> LLM auth (if set, overrides header)
+DEFAULT_LLM_ENDPOINT = os.getenv("DEFAULT_LLM_ENDPOINT", "http://127.0.0.1:8317/v1/chat/completions")
+DEFAULT_CACHE_TTL_DAYS = int(os.getenv("DEFAULT_CACHE_TTL_DAYS", "30"))
 CACHE_TTL_CONFIG_KEY = "tl_config:cache_ttl_days"  # Redis key for TTL config
-LOG_DIR = Path("logs")
-MAX_LOG_SIZE_MB = 300
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+MAX_LOG_SIZE_MB = int(os.getenv("MAX_LOG_SIZE_MB", "300"))
 
 # Redis connection
 REDIS_CONN_STRING = os.getenv("REDIS_CONN_STRING", "redis://localhost:6379/0")
@@ -129,6 +130,51 @@ def generate_cache_key(body: dict, user_level: str = "") -> str:
     # Include user level in the hash
     combined = f"{content_str}|level:{user_level}"
     return hashlib.sha256(combined.encode()).hexdigest()[:32]
+
+
+def is_valid_response_content(response_data: dict) -> bool:
+    """
+    Validate that response content is not empty or invalid.
+    Checks for: null, empty string, "Empty string.", zero-width spaces, etc.
+    """
+    try:
+        choices = response_data.get("choices", [])
+        if not choices:
+            return False
+        
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        
+        # Check for null
+        if content is None:
+            return False
+        
+        # Check for empty or whitespace-only string
+        if not isinstance(content, str):
+            return False
+        
+        # Strip regular whitespace
+        stripped = content.strip()
+        if not stripped:
+            return False
+        
+        # Check for known invalid responses
+        invalid_patterns = [
+            "Empty string.",
+            "​​",  # Zero-width spaces
+            "\u200b",  # Zero-width space
+            "\u200c",  # Zero-width non-joiner
+            "\u200d",  # Zero-width joiner
+            "\ufeff",  # BOM
+        ]
+        
+        for pattern in invalid_patterns:
+            if stripped == pattern or stripped.replace(pattern, "") == "":
+                return False
+        
+        return True
+    except Exception:
+        return False
 
 
 def extract_user_level(body: dict) -> str:
@@ -241,11 +287,12 @@ async def chat_completions(request: Request):
         print(f"[AUTH FAIL] Expected: '{SITE_AUTH_TOKEN}'")
         raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid API key")
     
-    print(f"[AUTH OK] Client authenticated, site_auth={'set' if site_auth else 'empty'}, site_api={site_api or 'default'}")
+    print(f"[AUTH OK] Client authenticated, site_auth={'env' if LLM_SITE_AUTH else ('header' if site_auth else 'none')}, site_api={site_api or 'default'}")
     
     # 3. Determine LLM endpoint and auth
+    # Priority: env LLM_SITE_AUTH > header site_auth > client_token
     target_url = site_api if site_api else DEFAULT_LLM_ENDPOINT
-    llm_auth = site_auth if site_auth else client_token  # Fallback to client token if site_auth not provided
+    llm_auth = LLM_SITE_AUTH if LLM_SITE_AUTH else (site_auth if site_auth else client_token)
     
     # 4. Parse request body
     try:
@@ -261,13 +308,20 @@ async def chat_completions(request: Request):
     cached_response = get_cached_response(cache_key)
     
     if cached_response:
-        print(f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} | Returning cached response")
-        return cached_response
+        # Validate cached content is not empty/invalid
+        if is_valid_response_content(cached_response):
+            print(f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} | Returning cached response")
+            return cached_response
+        else:
+            print(f"⚠️ [CACHE INVALID] key={cache_key[:16]}... | Cached content is empty, fetching fresh")
     
     print(f"[CACHE MISS] {cache_key} (level: {user_level}) -> {target_url}")
     
     # 7. Prepare body for forwarding (remove x_ fields and inject /no-think)
     forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}
+    
+    # Force non-streaming mode to prevent issues
+    forward_body["stream"] = False
     
     # Inject /no-think at the start of user message content (for DeepSeek etc.)
     if forward_body.get("messages"):
@@ -299,10 +353,16 @@ async def chat_completions(request: Request):
     if response.status_code == 200:
         try:
             response_data = response.json()
-            # Cache successful response
-            set_cached_response(cache_key, response_data)
-            # Log for vocabulary building
-            log_request_response(body, response_data, cache_key)
+            
+            # Validate content is not empty before caching
+            if is_valid_response_content(response_data):
+                # Cache successful response
+                set_cached_response(cache_key, response_data)
+                # Log for vocabulary building
+                log_request_response(body, response_data, cache_key)
+            else:
+                print(f"[SKIP CACHE] Empty or invalid content detected, not caching")
+            
             return response_data
         except Exception:
             return Response(content=response.text, status_code=response.status_code)

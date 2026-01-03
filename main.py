@@ -315,7 +315,16 @@ async def chat_completions(request: Request):
         else:
             print(f"⚠️ [CACHE INVALID] key={cache_key[:16]}... | Cached content is empty, fetching fresh")
     
-    print(f"[CACHE MISS] {cache_key} (level: {user_level}) -> {target_url}")
+    # Debug: print text preview for cache miss analysis
+    messages = body.get("messages", [])
+    user_msg = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            user_msg = msg.get("content", "")[:80]
+            break
+    print(f"[CACHE MISS] key={cache_key} level={user_level}")
+    print(f"[CACHE MISS] text preview: \"{user_msg}...\"")
+    print(f"[CACHE MISS] target: {target_url}")
     
     # 7. Prepare body for forwarding (remove x_ fields and inject /no-think)
     forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}

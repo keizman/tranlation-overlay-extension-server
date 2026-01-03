@@ -261,7 +261,7 @@ async def chat_completions(request: Request):
     cached_response = get_cached_response(cache_key)
     
     if cached_response:
-        print(f"[CACHE HIT] {cache_key} (level: {user_level})")
+        print(f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} | Returning cached response")
         return cached_response
     
     print(f"[CACHE MISS] {cache_key} (level: {user_level}) -> {target_url}")
@@ -307,6 +307,11 @@ async def chat_completions(request: Request):
         except Exception:
             return Response(content=response.text, status_code=response.status_code)
     else:
+        # Log LLM error details
+        print(f"[LLM ERROR] Status: {response.status_code}")
+        print(f"[LLM ERROR] Target: {target_url}")
+        print(f"[LLM ERROR] Auth used: Bearer {llm_auth[:20]}... (truncated)")
+        print(f"[LLM ERROR] Response: {response.text[:200]}")
         # Return error as-is
         return Response(
             content=response.text,

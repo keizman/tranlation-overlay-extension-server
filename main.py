@@ -121,11 +121,103 @@ def refresh_all_cache_ttls(days: int):
         print(f"[WARN] Failed to refresh cache TTLs: {e}")
 
 
+import re
+import unicodedata
+
+
+def normalize_for_cache(text: str) -> str:
+    """
+    Normalize text content before cache hash calculation.
+    Removes dynamic content that may change between page loads but doesn't affect translation.
+    """
+    if not text:
+        return ""
+    
+    normalized = text
+    
+    # 1. Unicode normalization (NFC form)
+    normalized = unicodedata.normalize('NFC', normalized)
+    
+    # 2. Remove zero-width characters
+    normalized = re.sub(r'[\u200B\uFEFF\u00AD\u200C\u200D\u2060]', '', normalized)
+    
+    # 3. Remove dynamic timestamps (Chinese)
+    normalized = re.sub(
+        r'\d+\s*(分钟|小时|天|秒|周|月|年)前|刚刚|刚才',
+        '',
+        normalized
+    )
+    
+    # 4. Remove dynamic timestamps (English)
+    normalized = re.sub(
+        r'\d+\s*(hours?|minutes?|days?|seconds?|weeks?|months?|years?)\s*ago|just now|a moment ago',
+        '',
+        normalized,
+        flags=re.IGNORECASE
+    )
+    
+    # 5. Remove stats/counts (Chinese)
+    normalized = re.sub(
+        r'\d+\.?\d*[kKmMwW万亿]?\s*(赞|喜欢|评论|回复|浏览|阅读|收藏|转发|分享|播放|观看)',
+        '',
+        normalized
+    )
+    
+    # 6. Remove stats/counts (English)
+    normalized = re.sub(
+        r'\d+\.?\d*[kKmM]?\s*(likes?|views?|comments?|replies?|reads?|shares?|plays?)',
+        '',
+        normalized,
+        flags=re.IGNORECASE
+    )
+    
+    # 7. Remove progress indicators
+    normalized = re.sub(
+        r'第?\d+[章节篇回话集]?\s*[\/\\|]\s*(共|of)?\s*\d+|[(（]\d+[\/\\|]\d+[)）]|\d+(\.\d+)?%',
+        '',
+        normalized,
+        flags=re.IGNORECASE
+    )
+    
+    # 8. Normalize full-width punctuation to half-width (common ones)
+    fullwidth_map = {
+        '：': ':',
+        '，': ',',
+        '。': '.',
+        '！': '!',
+        '？': '?',
+        '（': '(',
+        '）': ')',
+        '【': '[',
+        '】': ']',
+        '"': '"',
+        '"': '"',
+        ''': "'",
+        ''': "'",
+    }
+    for fw, hw in fullwidth_map.items():
+        normalized = normalized.replace(fw, hw)
+    
+    # 9. Normalize whitespace (collapse multiple spaces/newlines to single space)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    return normalized
+
+
 def generate_cache_key(body: dict, user_level: str = "") -> str:
     """Generate cache key from request body messages array + user level."""
     # Hash messages array (core content) + user level
     messages = body.get("messages", [])
-    content_str = json.dumps(messages, sort_keys=True, ensure_ascii=False)
+    
+    # Normalize message content before hashing
+    normalized_messages = []
+    for msg in messages:
+        normalized_msg = msg.copy()
+        if "content" in normalized_msg and isinstance(normalized_msg["content"], str):
+            normalized_msg["content"] = normalize_for_cache(normalized_msg["content"])
+        normalized_messages.append(normalized_msg)
+    
+    content_str = json.dumps(normalized_messages, sort_keys=True, ensure_ascii=False)
     
     # Include user level in the hash
     combined = f"{content_str}|level:{user_level}"

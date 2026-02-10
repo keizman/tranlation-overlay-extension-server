@@ -1,48 +1,146 @@
 # Translation Overlay Extension Server
 
-A FastAPI proxy server for LLM translation requests with Redis caching.
-
-## Features
-
-- **OpenAI-compatible API**: Drop-in replacement endpoint `/v1/chat/completions`
-- **Authentication**: `site_auth` header validation
-- **Dynamic routing**: `site_api` header for custom LLM endpoints
-- **Redis caching**: 3-day TTL for translation results
-- **Auto-logging**: Daily JSON logs with auto-compression at 300MB
+FastAPI server with:
+1. Core OpenAI-compatible proxy (`/v1/chat/completions`)
+2. Enladder-compatible word extraction (`/api/app/v1/words/extract`)
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Configure environment
 cp .env.example .env
-# Edit .env with your Redis connection string
-
-# Run server
 uvicorn main:app --reload --port 8000
 ```
 
-## API Usage
+## Auth Model (Code Truth)
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-api-key" \
-  -H "site_auth: YXBpLTEyMzQ1Ng==" \
-  -H "site_api: https://api.openai.com/v1/chat/completions" \
-  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
+- Outer auth token (client -> server):
+  - `Authorization: Bearer <SITE_AUTH_TOKEN>`
+  - Default `SITE_AUTH_TOKEN=YXBpLTEyMzQ1Ng==`
+- Upstream LLM auth for `/v1/chat/completions`, priority:
+  1. `LLM_SITE_AUTH` (env)
+  2. `site_auth` header
+  3. outer auth token
+- Upstream LLM endpoint:
+  - `site_api` header if provided, else `DEFAULT_LLM_ENDPOINT`
+
+## API List
+
+### Core Interface
+
+1. `POST /v1/chat/completions`
+   - OpenAI-compatible passthrough + Redis cache
+   - Includes cache key normalization (`normalize_for_cache`)
+   - Existing/original behavior is preserved
+
+2. `GET /health`
+3. `GET /config/cache-ttl`
+4. `POST /config/cache-ttl`
+5. `GET /cache/stats`
+
+### Enladder-Compatible Interface
+
+1. `POST /api/app/v1/words/extract`
+   - Requires outer auth:
+     - `Authorization: Bearer <SITE_AUTH_TOKEN>`
+   - Request fields:
+     - `text`, `annotationMode`, `filterMode`, `frequency`, `outputMode`, `lang`, `targetLanguage`, `maxWords`, `model`
+   - Response:
+     - Backward-compatible field:
+       - `data.translations` (`{ "word": "译文" }`)
+     - Additional fields:
+       - `requestId`
+       - `data.items` (`[{ "original", "translation", "zipf", "rank" }]`)
+       - `data.meta` (`engine`, `detectedSourceLanguage`, `targetLanguage`, `filterMode`, `frequency`, `latencyMs`, ...)
+   - Engine:
+     - `wordfreq + google-translate` (non-LLM)
+
+## Cache Behavior
+
+- `normalize_for_cache` is only used by:
+  - `POST /v1/chat/completions`
+- `/api/app/v1/words/extract` does not use cache normalization.
+
+## Environment Variables
+
+```env
+SITE_AUTH_TOKEN=YXBpLTEyMzQ1Ng==
+LLM_SITE_AUTH=
+DEFAULT_LLM_ENDPOINT=http://127.0.0.1:8317/v1/chat/completions
+DEFAULT_COMPAT_TARGET_LANGUAGE=zh-CN
+REDIS_CONN_STRING=redis://localhost:6379/0
+DEFAULT_CACHE_TTL_DAYS=30
+LOG_DIR=logs
+MAX_LOG_SIZE_MB=300
 ```
 
-## Headers
+## Real Request/Response Sample
 
-| Header | Required | Description |
-|--------|----------|-------------|
-| `Authorization` | Yes | Bearer token for LLM API |
-| `site_auth` | Yes | Fixed token `YXBpLTEyMzQ1Ng==` (401 if invalid) |
-| `site_api` | No | Target LLM endpoint (default: llmproai.xyz) |
+Below is a real response captured from local call (FastAPI TestClient), not hand-written output.
 
-## Cache Key
+### `/api/app/v1/words/extract`
 
-Cache key is generated from `hash(messages array)`, ignoring temperature and other params.
+Input:
+
+```json
+{
+  "text": "The abduction case shocked the paradigm of modern society while ubiquitous systems remained stable.",
+  "annotationMode": "SUPERSCRIPTS",
+  "filterMode": "FREQUENCY",
+  "frequency": "3000",
+  "outputMode": "ANNOTATION",
+  "lang": "en",
+  "targetLanguage": "zh-CN"
+}
+```
+
+Output:
+
+```json
+{
+  "success": true,
+  "requestId": "req_b7ccb57bb8314b0e",
+  "data": {
+    "translations": {
+      "ubiquitous": "无处不在的",
+      "abduction": "绑架",
+      "paradigm": "范例"
+    },
+    "items": [
+      {
+        "original": "ubiquitous",
+        "translation": "无处不在的",
+        "zipf": 3.42,
+        "rank": "uncommon"
+      },
+      {
+        "original": "abduction",
+        "translation": "绑架",
+        "zipf": 3.43,
+        "rank": "uncommon"
+      },
+      {
+        "original": "paradigm",
+        "translation": "范例",
+        "zipf": 3.61,
+        "rank": "uncommon"
+      }
+    ],
+    "engine": "wordfreq+google-translate",
+    "meta": {
+      "engine": "wordfreq+google-translate",
+      "detectedSourceLanguage": "en",
+      "requestedTargetLanguage": "zh-CN",
+      "targetLanguage": "zh-CN",
+      "filterMode": "FREQUENCY",
+      "frequency": "3000",
+      "thresholdZipf": 3.8,
+      "sourceWordCount": 13,
+      "candidateCount": 3,
+      "maxWords": 120,
+      "lang": "en",
+      "latencyMs": 1189
+    }
+  }
+}
+```

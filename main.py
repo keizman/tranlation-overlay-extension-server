@@ -22,6 +22,10 @@ load_dotenv()
 
 app = FastAPI(title="Translation Overlay Server", version="1.0.0")
 
+# Register routers (modular API endpoints)
+from routers.compat_router import router as compat_router
+app.include_router(compat_router)
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,

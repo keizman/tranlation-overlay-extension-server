@@ -76,6 +76,7 @@ SITE_AUTH_TOKEN=YXBpLTEyMzQ1Ng==
 LLM_SITE_AUTH=
 DEFAULT_LLM_ENDPOINT=http://127.0.0.1:8317/v1/chat/completions
 DEFAULT_LLM_MODEL=gemini-2.5-flash-lite
+FORCE_DEFAULT_LLM_MODEL=true
 DEFAULT_COMPAT_TARGET_LANGUAGE=zh-CN
 DICTIONARY_SERVER_BASE_URL=http://127.0.0.1:9000
 DICTIONARY_SERVER_BATCH_PATH=/api/v2/translate/batch
@@ -86,7 +87,9 @@ LOG_DIR=logs
 MAX_LOG_SIZE_MB=300
 ```
 
-`DEFAULT_LLM_MODEL` is used when `/v1/chat/completions` request body does not include `model`.
+`DEFAULT_LLM_MODEL` and `FORCE_DEFAULT_LLM_MODEL` control upstream model selection:
+- `FORCE_DEFAULT_LLM_MODEL=true` (default): always override request `model` with `DEFAULT_LLM_MODEL`.
+- `FORCE_DEFAULT_LLM_MODEL=false`: use request `model` when provided, fallback to `DEFAULT_LLM_MODEL`.
 
 ## Real Request/Response Sample
 

@@ -40,6 +40,7 @@ SITE_AUTH_TOKEN = os.getenv("SITE_AUTH_TOKEN", "YXBpLTEyMzQ1Ng==")  # Client -> 
 LLM_SITE_AUTH = os.getenv("LLM_SITE_AUTH", "")  # Server -> LLM auth (if set, overrides header)
 DEFAULT_LLM_ENDPOINT = os.getenv("DEFAULT_LLM_ENDPOINT", "http://127.0.0.1:8317/v1/chat/completions")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-2.5-flash-lite").strip()
+FORCE_DEFAULT_LLM_MODEL = os.getenv("FORCE_DEFAULT_LLM_MODEL", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_CACHE_TTL_DAYS = int(os.getenv("DEFAULT_CACHE_TTL_DAYS", "30"))
 CACHE_TTL_CONFIG_KEY = "tl_config:cache_ttl_days"  # Redis key for TTL config
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
@@ -64,6 +65,11 @@ try:
 except Exception as e:
     print(f"[WARN] Redis connection failed: {e}. Running without cache.")
     redis_client = None
+
+print(
+    f"[INFO] LLM model policy: DEFAULT_LLM_MODEL={DEFAULT_LLM_MODEL} "
+    f"FORCE_DEFAULT_LLM_MODEL={FORCE_DEFAULT_LLM_MODEL}"
+)
 
 
 def get_cache_ttl_days() -> int:
@@ -209,8 +215,22 @@ def normalize_for_cache(text: str) -> str:
     return normalized
 
 
-def generate_cache_key(body: dict, user_level: str = "") -> str:
-    """Generate cache key from request body messages array + user level."""
+def resolve_effective_model(body: dict) -> tuple[str, str]:
+    """
+    Resolve effective model for upstream LLM call.
+    Returns (effective_model, model_source).
+    model_source in: request | env_default | env_force
+    """
+    request_model = body.get("model")
+    if isinstance(request_model, str) and request_model.strip():
+        if FORCE_DEFAULT_LLM_MODEL:
+            return DEFAULT_LLM_MODEL, "env_force"
+        return request_model.strip(), "request"
+    return DEFAULT_LLM_MODEL, "env_default"
+
+
+def generate_cache_key(body: dict, user_level: str = "", model: str = "") -> str:
+    """Generate cache key from request body messages array + user level + model."""
     # Hash messages array (core content) + user level
     messages = body.get("messages", [])
     
@@ -224,8 +244,8 @@ def generate_cache_key(body: dict, user_level: str = "") -> str:
     
     content_str = json.dumps(normalized_messages, sort_keys=True, ensure_ascii=False)
     
-    # Include user level in the hash
-    combined = f"{content_str}|level:{user_level}"
+    # Include user level + effective model in the hash
+    combined = f"{content_str}|level:{user_level}|model:{model}"
     return hashlib.sha256(combined.encode()).hexdigest()[:32]
 
 
@@ -399,15 +419,20 @@ async def chat_completions(request: Request):
     
     # 5. Extract user level for cache key
     user_level = extract_user_level(body)
+    effective_model, model_source = resolve_effective_model(body)
+    body["model"] = effective_model
     
     # 6. Check cache
-    cache_key = generate_cache_key(body, user_level)
+    cache_key = generate_cache_key(body, user_level, effective_model)
     cached_response = get_cached_response(cache_key)
     
     if cached_response:
         # Validate cached content is not empty/invalid
         if is_valid_response_content(cached_response):
-            print(f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} | Returning cached response")
+            print(
+                f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} "
+                f"model={effective_model} model_source={model_source} | Returning cached response"
+            )
             return cached_response
         else:
             print(f"⚠️ [CACHE INVALID] key={cache_key[:16]}... | Cached content is empty, fetching fresh")
@@ -419,17 +444,13 @@ async def chat_completions(request: Request):
         if msg.get("role") == "user":
             user_msg = msg.get("content", "")[:80]
             break
-    print(f"[CACHE MISS] key={cache_key} level={user_level}")
+    print(f"[CACHE MISS] key={cache_key} level={user_level} model={effective_model} model_source={model_source}")
     print(f"[CACHE MISS] text preview: \"{user_msg}...\"")
     print(f"[CACHE MISS] target: {target_url}")
     
     # 7. Prepare body for forwarding (remove x_ fields and inject /no-think)
     forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}
-
-    # Ensure model is always present and can be changed quickly via env.
-    request_model = forward_body.get("model")
-    if not isinstance(request_model, str) or not request_model.strip():
-        forward_body["model"] = DEFAULT_LLM_MODEL
+    forward_body["model"] = effective_model
 
     # Force non-streaming mode to prevent issues
     forward_body["stream"] = False
@@ -450,7 +471,7 @@ async def chat_completions(request: Request):
     
     print(
         f"[LLM] target={target_url} model={forward_body.get('model')} "
-        f"model_source={'request' if isinstance(request_model, str) and request_model.strip() else 'env_default'}"
+        f"model_source={model_source}"
     )
 
     try:

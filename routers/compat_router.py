@@ -20,7 +20,13 @@ router = APIRouter(tags=["compat"])
 SITE_AUTH_TOKEN = os.getenv("SITE_AUTH_TOKEN", "YXBpLTEyMzQ1Ng==")
 DEFAULT_COMPAT_TARGET_LANGUAGE = os.getenv("DEFAULT_COMPAT_TARGET_LANGUAGE", "zh-CN")
 
-GOOGLE_TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+DICTIONARY_SERVER_BASE_URL = os.getenv(
+    "DICTIONARY_SERVER_BASE_URL", "http://127.0.0.1:9000"
+).rstrip("/")
+DICTIONARY_SERVER_BATCH_PATH = os.getenv(
+    "DICTIONARY_SERVER_BATCH_PATH", "/api/v2/translate/batch"
+)
+DICTIONARY_SERVER_TIMEOUT_MS = int(os.getenv("DICTIONARY_SERVER_TIMEOUT_MS", "20000"))
 
 COMPAT_FREQUENCY_THRESHOLDS = {
     "500": 4.8,
@@ -29,7 +35,10 @@ COMPAT_FREQUENCY_THRESHOLDS = {
     "5000": 3.5,
     "8000": 3.2,
 }
-ENGINE_NAME = "wordfreq+google-translate"
+
+ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR = "UNSUPPORTED_LANGUAGE_PAIR"
+ERROR_CODE_INVALID_LANGUAGE = "INVALID_LANGUAGE"
+ENGINE_NAME = "wordfreq+dictionary-batch"
 
 
 def extract_client_token(request: Request) -> str:
@@ -45,64 +54,65 @@ def validate_outer_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid API key")
 
 
+def normalize_source_language(lang: str) -> str:
+    cleaned = (lang or "").strip().lower()
+    mapping = {
+        "en": "en",
+        "en-us": "en",
+        "en-gb": "en",
+        "ja": "ja",
+        "ko": "ko",
+        "de": "de",
+        "ru": "ru",
+    }
+    return mapping.get(cleaned, "")
+
+
 def normalize_target_language(lang: str) -> str:
     cleaned = (lang or "").strip().lower()
     if not cleaned:
-        return DEFAULT_COMPAT_TARGET_LANGUAGE
+        cleaned = DEFAULT_COMPAT_TARGET_LANGUAGE.lower()
 
     mapping = {
         "zh": "zh-CN",
         "zh-cn": "zh-CN",
         "zh-hans": "zh-CN",
-        "zh-tw": "zh-TW",
+        "en": "en",
         "en-us": "en",
         "en-gb": "en",
+        "ja": "ja",
+        "ko": "ko",
+        "de": "de",
+        "ru": "ru",
     }
-    return mapping.get(cleaned, lang.strip())
+    return mapping.get(cleaned, "")
 
 
-async def google_translate_text(
-    client: httpx.AsyncClient, text: str, target_language: str
-) -> Tuple[str, str]:
-    params = {
-        "client": "gtx",
-        "sl": "auto",
-        "tl": normalize_target_language(target_language),
-        "dt": "t",
-        "q": text,
-    }
-    try:
-        response = await client.get(
-            GOOGLE_TRANSLATE_ENDPOINT,
-            params=params,
-            timeout=20.0,
-        )
-        response.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Translate API failed: {str(e)}")
-
-    try:
-        data = response.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail="Translate API returned invalid JSON")
-
-    translated = ""
-    if isinstance(data, list) and data and isinstance(data[0], list):
-        for seg in data[0]:
-            if isinstance(seg, list) and seg and isinstance(seg[0], str):
-                translated += seg[0]
-
-    if not translated.strip():
-        translated = text
-
-    detected = data[2] if isinstance(data, list) and len(data) > 2 else "unknown"
-    if not isinstance(detected, str):
-        detected = "unknown"
-
-    return translated.strip(), detected
+def validate_language_pair(source_language: str, target_language: str) -> Optional[str]:
+    if source_language == "en" and target_language == "zh-CN":
+        return None
+    if source_language == "en" and target_language in {"ja", "ko", "de", "ru"}:
+        return None
+    if source_language in {"ja", "ko", "de", "ru"} and target_language == "en":
+        return None
+    return f"Unsupported language pair: {source_language} -> {target_language}"
 
 
-def tokenize_words_for_compat(text: str) -> List[str]:
+def tokenize_words_for_compat(text: str, language: str) -> List[str]:
+    lang = (language or "").lower()
+    if lang in {"en", "de"}:
+        words = re.findall(r"[A-Za-zÄÖÜäöüß]+(?:'[A-Za-zÄÖÜäöüß]+)?", text)
+        return sorted(set(word.lower() for word in words))
+    if lang == "ru":
+        words = re.findall(r"[А-Яа-яЁё]+", text)
+        return sorted(set(words))
+    if lang == "ko":
+        words = re.findall(r"[가-힣]+", text)
+        return sorted(set(words))
+    if lang == "ja":
+        words = re.findall(r"[ぁ-んァ-ンー一-龯]+", text)
+        return sorted(set(words))
+    # Fallback: keep previous English-like behavior for unknown languages.
     return sorted(set(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower())))
 
 
@@ -116,6 +126,88 @@ def zipf_to_rank_label(zipf: float) -> str:
     if zipf >= 2.0:
         return "rare"
     return "very_rare"
+
+
+def safe_zipf_frequency(word: str, language: str) -> float:
+    try:
+        return zipf_frequency(word, language)
+    except Exception:
+        return 0.0
+
+
+def build_batch_url() -> str:
+    if DICTIONARY_SERVER_BATCH_PATH.startswith("/"):
+        return f"{DICTIONARY_SERVER_BASE_URL}{DICTIONARY_SERVER_BATCH_PATH}"
+    return f"{DICTIONARY_SERVER_BASE_URL}/{DICTIONARY_SERVER_BATCH_PATH}"
+
+
+async def query_dictionary_batch(
+    client: httpx.AsyncClient,
+    words: List[str],
+    source_language: str,
+    target_language: str,
+) -> Dict[str, str]:
+    payload = {
+        "targetLanguage": target_language,
+        "items": [{"word": word, "language": source_language} for word in words],
+    }
+
+    url = build_batch_url()
+    try:
+        response = await client.post(
+            url,
+            json=payload,
+            timeout=DICTIONARY_SERVER_TIMEOUT_MS / 1000.0,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Dictionary batch request failed: {type(e).__name__}: {repr(e)}",
+        )
+
+    try:
+        body = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502, detail="Dictionary batch returned invalid JSON"
+        )
+
+    if response.status_code == 422:
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        code = error.get("code", ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR)
+        message = error.get("message", "Unsupported language pair")
+        if code == ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR, "message": message},
+            )
+        raise HTTPException(status_code=422, detail={"code": code, "message": message})
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Dictionary batch API failed: HTTP {response.status_code}",
+        )
+
+    if not isinstance(body, dict) or not body.get("success"):
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        code = error.get("code", "DICTIONARY_BATCH_ERROR")
+        message = error.get("message", "Dictionary batch API returned failure")
+        status = 422 if code == ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR else 502
+        raise HTTPException(status_code=status, detail={"code": code, "message": message})
+
+    results = body.get("data", {}).get("results", [])
+    translation_map: Dict[str, str] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        word = str(item.get("word", "")).strip()
+        if not word:
+            continue
+        translation = item.get("translation", "")
+        translation_map[word] = translation if isinstance(translation, str) else ""
+
+    return translation_map
 
 
 class CompatWordsExtractRequest(BaseModel):
@@ -138,34 +230,54 @@ async def compat_words_extract(request: Request, req: CompatWordsExtractRequest)
     start_ts = time.perf_counter()
     request_id = f"req_{uuid.uuid4().hex[:16]}"
 
+    source_language = normalize_source_language(req.lang)
+    target_language = normalize_target_language(req.targetLanguage)
+
+    if not source_language or not target_language:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_INVALID_LANGUAGE,
+                "message": "Invalid language. Supported source: en/ja/ko/de/ru. Supported target: zh-CN/en/ja/ko/de/ru.",
+            },
+        )
+
+    pair_error = validate_language_pair(source_language, target_language)
+    if pair_error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": ERROR_CODE_UNSUPPORTED_LANGUAGE_PAIR,
+                "message": pair_error,
+            },
+        )
+
     threshold = COMPAT_FREQUENCY_THRESHOLDS.get(
         req.frequency, COMPAT_FREQUENCY_THRESHOLDS["3000"]
     )
-    normalized_target_language = normalize_target_language(req.targetLanguage)
     normalized_filter_mode = req.filterMode.upper()
-    tokens = tokenize_words_for_compat(req.text)
+    tokens = tokenize_words_for_compat(req.text, source_language)
 
     candidate_pairs: List[Tuple[str, float]] = []
     if normalized_filter_mode == "LEXICON":
-        # Lexicon mode: keep a broader set for learning
         for word in tokens[: req.maxWords]:
-            candidate_pairs.append((word, zipf_frequency(word, req.lang)))
+            candidate_pairs.append((word, safe_zipf_frequency(word, source_language)))
     else:
         difficult_pairs = []
-        for w in tokens:
-            zf = zipf_frequency(w, req.lang)
+        for word in tokens:
+            zf = safe_zipf_frequency(word, source_language)
             if zf < threshold:
-                difficult_pairs.append((w, zf))
+                difficult_pairs.append((word, zf))
         difficult_pairs.sort(key=lambda x: x[1])
         candidate_pairs = difficult_pairs[: req.maxWords]
 
-    candidate_words = [w for w, _ in candidate_pairs]
+    candidate_words = [word for word, _ in candidate_pairs]
     items = []
     for word, zf in candidate_pairs:
         items.append(
             {
                 "original": word,
-                "translation": word,
+                "translation": "",
                 "zipf": round(zf, 2),
                 "rank": zipf_to_rank_label(zf),
             }
@@ -174,16 +286,16 @@ async def compat_words_extract(request: Request, req: CompatWordsExtractRequest)
     latency_ms = int((time.perf_counter() - start_ts) * 1000)
     default_meta = {
         "engine": ENGINE_NAME,
-        "detectedSourceLanguage": req.lang,
+        "detectedSourceLanguage": source_language,
         "requestedTargetLanguage": req.targetLanguage,
-        "targetLanguage": normalized_target_language,
+        "targetLanguage": target_language,
         "filterMode": normalized_filter_mode,
         "frequency": req.frequency,
         "thresholdZipf": threshold,
         "sourceWordCount": len(tokens),
         "candidateCount": len(candidate_words),
         "maxWords": req.maxWords,
-        "lang": req.lang,
+        "lang": source_language,
         "latencyMs": latency_ms,
     }
 
@@ -199,20 +311,21 @@ async def compat_words_extract(request: Request, req: CompatWordsExtractRequest)
             },
         }
 
+    async with httpx.AsyncClient(trust_env=False) as client:
+        translation_map = await query_dictionary_batch(
+            client=client,
+            words=candidate_words,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
     translations: Dict[str, str] = {}
-    detected_source_language = req.lang
-    async with httpx.AsyncClient() as client:
-        for index, word in enumerate(candidate_words):
-            translated, detected = await google_translate_text(
-                client, word, req.targetLanguage
-            )
-            translations[word] = translated if translated else word
-            items[index]["translation"] = translations[word]
-            if detected and detected != "unknown":
-                detected_source_language = detected
+    for index, word in enumerate(candidate_words):
+        translated = translation_map.get(word, "")
+        translations[word] = translated
+        items[index]["translation"] = translated
 
     latency_ms = int((time.perf_counter() - start_ts) * 1000)
-    default_meta["detectedSourceLanguage"] = detected_source_language
     default_meta["latencyMs"] = latency_ms
 
     return {

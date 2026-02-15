@@ -39,6 +39,7 @@ app.add_middleware(
 SITE_AUTH_TOKEN = os.getenv("SITE_AUTH_TOKEN", "YXBpLTEyMzQ1Ng==")  # Client -> Server auth
 LLM_SITE_AUTH = os.getenv("LLM_SITE_AUTH", "")  # Server -> LLM auth (if set, overrides header)
 DEFAULT_LLM_ENDPOINT = os.getenv("DEFAULT_LLM_ENDPOINT", "http://127.0.0.1:8317/v1/chat/completions")
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-2.5-flash-lite").strip()
 DEFAULT_CACHE_TTL_DAYS = int(os.getenv("DEFAULT_CACHE_TTL_DAYS", "30"))
 CACHE_TTL_CONFIG_KEY = "tl_config:cache_ttl_days"  # Redis key for TTL config
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
@@ -424,7 +425,12 @@ async def chat_completions(request: Request):
     
     # 7. Prepare body for forwarding (remove x_ fields and inject /no-think)
     forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}
-    
+
+    # Ensure model is always present and can be changed quickly via env.
+    request_model = forward_body.get("model")
+    if not isinstance(request_model, str) or not request_model.strip():
+        forward_body["model"] = DEFAULT_LLM_MODEL
+
     # Force non-streaming mode to prevent issues
     forward_body["stream"] = False
     
@@ -442,6 +448,11 @@ async def chat_completions(request: Request):
         "Authorization": f"Bearer {llm_auth}",  # Use LLM API key
     }
     
+    print(
+        f"[LLM] target={target_url} model={forward_body.get('model')} "
+        f"model_source={'request' if isinstance(request_model, str) and request_model.strip() else 'env_default'}"
+    )
+
     try:
         async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
             response = await client.post(

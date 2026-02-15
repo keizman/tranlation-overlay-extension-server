@@ -53,7 +53,15 @@ uvicorn main:app --reload --port 8000
        - `data.items` (`[{ "original", "translation", "zipf", "rank" }]`)
        - `data.meta` (`engine`, `detectedSourceLanguage`, `targetLanguage`, `filterMode`, `frequency`, `latencyMs`, ...)
    - Engine:
-     - `wordfreq + google-translate` (non-LLM)
+     - `wordfreq + dictionary-batch` (non-LLM)
+   - Translation source:
+     - Calls dictionary server batch API (`POST /api/v2/translate/batch`)
+   - Supported pairs:
+     - `en -> zh-CN`
+     - `en -> ja|ko|de|ru`
+     - `ja|ko|de|ru -> en`
+   - Unsupported pairs:
+     - returns `422` with code `UNSUPPORTED_LANGUAGE_PAIR`
 
 ## Cache Behavior
 
@@ -67,12 +75,18 @@ uvicorn main:app --reload --port 8000
 SITE_AUTH_TOKEN=YXBpLTEyMzQ1Ng==
 LLM_SITE_AUTH=
 DEFAULT_LLM_ENDPOINT=http://127.0.0.1:8317/v1/chat/completions
+DEFAULT_LLM_MODEL=gemini-2.5-flash-lite
 DEFAULT_COMPAT_TARGET_LANGUAGE=zh-CN
+DICTIONARY_SERVER_BASE_URL=http://127.0.0.1:9000
+DICTIONARY_SERVER_BATCH_PATH=/api/v2/translate/batch
+DICTIONARY_SERVER_TIMEOUT_MS=20000
 REDIS_CONN_STRING=redis://localhost:6379/0
 DEFAULT_CACHE_TTL_DAYS=30
 LOG_DIR=logs
 MAX_LOG_SIZE_MB=300
 ```
+
+`DEFAULT_LLM_MODEL` is used when `/v1/chat/completions` request body does not include `model`.
 
 ## Real Request/Response Sample
 
@@ -102,9 +116,9 @@ Output:
   "requestId": "req_b7ccb57bb8314b0e",
   "data": {
     "translations": {
-      "ubiquitous": "无处不在的",
+      "ubiquitous": "普遍存在的",
       "abduction": "绑架",
-      "paradigm": "范例"
+      "paradigm": "范式"
     },
     "items": [
       {
@@ -126,9 +140,9 @@ Output:
         "rank": "uncommon"
       }
     ],
-    "engine": "wordfreq+google-translate",
+    "engine": "wordfreq+dictionary-batch",
     "meta": {
-      "engine": "wordfreq+google-translate",
+      "engine": "wordfreq+dictionary-batch",
       "detectedSourceLanguage": "en",
       "requestedTargetLanguage": "zh-CN",
       "targetLanguage": "zh-CN",

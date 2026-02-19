@@ -8,6 +8,7 @@ import json
 import os
 import gzip
 import shutil
+from threading import Lock
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -41,10 +42,22 @@ LLM_SITE_AUTH = os.getenv("LLM_SITE_AUTH", "")  # Server -> LLM auth (if set, ov
 DEFAULT_LLM_ENDPOINT = os.getenv("DEFAULT_LLM_ENDPOINT", "http://127.0.0.1:8317/v1/chat/completions")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-2.5-flash-lite").strip()
 FORCE_DEFAULT_LLM_MODEL = os.getenv("FORCE_DEFAULT_LLM_MODEL", "true").strip().lower() in {"1", "true", "yes", "on"}
+FAST_FIRST_REQUEST_ENABLED = os.getenv("FAST_FIRST_REQUEST_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+FAST_LLM_ENDPOINT = os.getenv("FAST_LLM_ENDPOINT", "").strip()
+FAST_LLM_MODEL = os.getenv("FAST_LLM_MODEL", "").strip()
+FAST_LLM_SITE_AUTHS = [
+    item.strip() for item in os.getenv("FAST_LLM_SITE_AUTHS", "").split(",") if item.strip()
+]
+FAST_LLM_KEY_ROTATION = os.getenv("FAST_LLM_KEY_ROTATION", "round_robin").strip().lower()
+FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR = os.getenv(
+    "FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_CACHE_TTL_DAYS = int(os.getenv("DEFAULT_CACHE_TTL_DAYS", "30"))
 CACHE_TTL_CONFIG_KEY = "tl_config:cache_ttl_days"  # Redis key for TTL config
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 MAX_LOG_SIZE_MB = int(os.getenv("MAX_LOG_SIZE_MB", "300"))
+FAST_LLM_AUTH_INDEX = 0
+FAST_LLM_AUTH_LOCK = Lock()
 
 # Redis connection
 REDIS_CONN_STRING = os.getenv("REDIS_CONN_STRING", "redis://localhost:6379/0")
@@ -69,6 +82,13 @@ except Exception as e:
 print(
     f"[INFO] LLM model policy: DEFAULT_LLM_MODEL={DEFAULT_LLM_MODEL} "
     f"FORCE_DEFAULT_LLM_MODEL={FORCE_DEFAULT_LLM_MODEL}"
+)
+print(
+    f"[INFO] FAST model policy: enabled={FAST_FIRST_REQUEST_ENABLED} "
+    f"fast_model={FAST_LLM_MODEL or '<inherit>'} "
+    f"fast_endpoint={'set' if FAST_LLM_ENDPOINT else 'inherit'} "
+    f"fast_keys={len(FAST_LLM_SITE_AUTHS)} "
+    f"fallback_to_default={FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR}"
 )
 
 
@@ -229,8 +249,136 @@ def resolve_effective_model(body: dict) -> tuple[str, str]:
     return DEFAULT_LLM_MODEL, "env_default"
 
 
-def generate_cache_key(body: dict, user_level: str = "", model: str = "") -> str:
-    """Generate cache key from request body messages array + user level + model."""
+def parse_page_request_seq(body: dict) -> Optional[int]:
+    """Parse x_page_request_seq from extension metadata."""
+    value = body.get("x_page_request_seq")
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isdigit():
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+    return None
+
+
+def should_use_fast_lane(body: dict) -> bool:
+    """Only first request per page can use FAST lane when enabled."""
+    if not FAST_FIRST_REQUEST_ENABLED:
+        return False
+    return parse_page_request_seq(body) == 1
+
+
+def next_fast_llm_auth() -> tuple[str, str]:
+    """Pick next FAST LLM key using configured rotation policy."""
+    if not FAST_LLM_SITE_AUTHS:
+        return "", "missing"
+
+    if FAST_LLM_KEY_ROTATION == "round_robin":
+        global FAST_LLM_AUTH_INDEX
+        with FAST_LLM_AUTH_LOCK:
+            selected_index = FAST_LLM_AUTH_INDEX % len(FAST_LLM_SITE_AUTHS)
+            FAST_LLM_AUTH_INDEX += 1
+        return FAST_LLM_SITE_AUTHS[selected_index], f"fast_pool[{selected_index}]"
+
+    return FAST_LLM_SITE_AUTHS[0], "fast_pool[0]"
+
+
+def resolve_primary_route(body: dict, default_route: dict) -> dict:
+    """Resolve whether to use default lane or FAST lane for current request."""
+    route = default_route.copy()
+
+    if not should_use_fast_lane(body):
+        route["lane_reason"] = "not_first_request"
+        return route
+
+    has_fast_override = bool(FAST_LLM_ENDPOINT or FAST_LLM_MODEL or FAST_LLM_SITE_AUTHS)
+    if not has_fast_override:
+        route["lane_reason"] = "fast_unconfigured"
+        return route
+
+    route["lane"] = "fast"
+    route["lane_reason"] = "first_request"
+
+    if FAST_LLM_ENDPOINT:
+        route["target_url"] = FAST_LLM_ENDPOINT
+
+    if FAST_LLM_MODEL:
+        route["model"] = FAST_LLM_MODEL
+        route["model_source"] = "env_fast"
+
+    fast_auth, fast_auth_source = next_fast_llm_auth()
+    if fast_auth:
+        route["llm_auth"] = fast_auth
+        route["auth_source"] = fast_auth_source
+
+    return route
+
+
+def build_forward_body(body: dict, model: str) -> dict:
+    """Build upstream payload by removing extension metadata and normalizing fields."""
+    forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}
+    forward_body["model"] = model
+    forward_body["stream"] = False
+
+    if forward_body.get("messages"):
+        normalized_messages = []
+        for msg in forward_body["messages"]:
+            if not isinstance(msg, dict):
+                normalized_messages.append(msg)
+                continue
+
+            normalized_msg = msg.copy()
+            if normalized_msg.get("role") == "user" and normalized_msg.get("content"):
+                content = normalized_msg["content"]
+                if not content.startswith("/no-think"):
+                    normalized_msg["content"] = "/no-think\n" + content
+            normalized_messages.append(normalized_msg)
+        forward_body["messages"] = normalized_messages
+
+    return forward_body
+
+
+async def forward_to_llm(route: dict, forward_body: dict) -> httpx.Response:
+    """Forward request to LLM endpoint selected by route policy."""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {route['llm_auth']}",
+    }
+
+    print(
+        f"[LLM] lane={route['lane']} target={route['target_url']} model={forward_body.get('model')} "
+        f"model_source={route['model_source']} auth_source={route['auth_source']}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+            return await client.post(
+                route["target_url"],
+                json=forward_body,
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LLM request timeout")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+
+
+def log_llm_error(response: httpx.Response, route: dict):
+    print(f"[LLM ERROR] Status: {response.status_code}")
+    print(f"[LLM ERROR] Lane: {route['lane']}")
+    print(f"[LLM ERROR] Target: {route['target_url']}")
+    print(f"[LLM ERROR] Auth source: {route['auth_source']}")
+    print(f"[LLM ERROR] Response: {response.text[:200]}")
+
+
+def generate_cache_key(
+    body: dict,
+    user_level: str = "",
+    model: str = "",
+    lane: str = "default",
+) -> str:
+    """Generate cache key from request body messages + user level + model + lane."""
     # Hash messages array (core content) + user level
     messages = body.get("messages", [])
     
@@ -244,8 +392,8 @@ def generate_cache_key(body: dict, user_level: str = "", model: str = "") -> str
     
     content_str = json.dumps(normalized_messages, sort_keys=True, ensure_ascii=False)
     
-    # Include user level + effective model in the hash
-    combined = f"{content_str}|level:{user_level}|model:{model}"
+    # Include user level + model + lane in the hash
+    combined = f"{content_str}|level:{user_level}|model:{model}|lane:{lane}"
     return hashlib.sha256(combined.encode()).hexdigest()[:32]
 
 
@@ -385,7 +533,7 @@ def check_and_compress_logs():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint with caching."""
-    
+
     # 1. Extract headers
     # - Authorization: Bearer <server_api_key> - used to validate client request
     # - site_auth: <llm_api_key> - used to authenticate with LLM
@@ -393,50 +541,66 @@ async def chat_completions(request: Request):
     authorization = request.headers.get("Authorization", "")
     site_auth = request.headers.get("site_auth", request.headers.get("site-auth", ""))
     site_api = request.headers.get("site_api", request.headers.get("site-api", ""))
-    
+
     # 2. Validate client request using Authorization Bearer token
     client_token = ""
     if authorization.startswith("Bearer "):
         client_token = authorization[7:]  # Remove "Bearer " prefix
-    
+
     if client_token != SITE_AUTH_TOKEN:
         print(f"[AUTH FAIL] Client token: '{client_token}'")
         print(f"[AUTH FAIL] Expected: '{SITE_AUTH_TOKEN}'")
         raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid API key")
-    
+
     print(f"[AUTH OK] Client authenticated, site_auth={'env' if LLM_SITE_AUTH else ('header' if site_auth else 'none')}, site_api={site_api or 'default'}")
-    
-    # 3. Determine LLM endpoint and auth
+
+    # 3. Determine default LLM endpoint and auth
     # Priority: env LLM_SITE_AUTH > header site_auth > client_token
-    target_url = site_api if site_api else DEFAULT_LLM_ENDPOINT
-    llm_auth = LLM_SITE_AUTH if LLM_SITE_AUTH else (site_auth if site_auth else client_token)
-    
+    default_target_url = site_api if site_api else DEFAULT_LLM_ENDPOINT
+    default_llm_auth = LLM_SITE_AUTH if LLM_SITE_AUTH else (site_auth if site_auth else client_token)
+
     # 4. Parse request body
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-    
-    # 5. Extract user level for cache key
+
+    # 5. Resolve default route + optional FAST lane
     user_level = extract_user_level(body)
     effective_model, model_source = resolve_effective_model(body)
-    body["model"] = effective_model
-    
+    default_route = {
+        "lane": "default",
+        "lane_reason": "default_lane",
+        "target_url": default_target_url,
+        "llm_auth": default_llm_auth,
+        "model": effective_model,
+        "model_source": model_source,
+        "auth_source": "env" if LLM_SITE_AUTH else ("header" if site_auth else "client"),
+    }
+    active_route = resolve_primary_route(body, default_route)
+    body["model"] = active_route["model"]
+
     # 6. Check cache
-    cache_key = generate_cache_key(body, user_level, effective_model)
+    cache_key = generate_cache_key(
+        body,
+        user_level,
+        active_route["model"],
+        active_route["lane"],
+    )
     cached_response = get_cached_response(cache_key)
-    
+
     if cached_response:
         # Validate cached content is not empty/invalid
         if is_valid_response_content(cached_response):
             print(
                 f"⚡ [CACHE HIT] key={cache_key[:16]}... level={user_level} "
-                f"model={effective_model} model_source={model_source} | Returning cached response"
+                f"lane={active_route['lane']} model={active_route['model']} "
+                f"model_source={active_route['model_source']} | Returning cached response"
             )
             return cached_response
         else:
             print(f"⚠️ [CACHE INVALID] key={cache_key[:16]}... | Cached content is empty, fetching fresh")
-    
+
     # Debug: print text preview for cache miss analysis
     messages = body.get("messages", [])
     user_msg = ""
@@ -444,53 +608,90 @@ async def chat_completions(request: Request):
         if msg.get("role") == "user":
             user_msg = msg.get("content", "")[:80]
             break
-    print(f"[CACHE MISS] key={cache_key} level={user_level} model={effective_model} model_source={model_source}")
-    print(f"[CACHE MISS] text preview: \"{user_msg}...\"")
-    print(f"[CACHE MISS] target: {target_url}")
-    
-    # 7. Prepare body for forwarding (remove x_ fields and inject /no-think)
-    forward_body = {k: v for k, v in body.items() if not k.startswith("x_")}
-    forward_body["model"] = effective_model
-
-    # Force non-streaming mode to prevent issues
-    forward_body["stream"] = False
-    
-    # Inject /no-think at the start of user message content (for DeepSeek etc.)
-    if forward_body.get("messages"):
-        for msg in forward_body["messages"]:
-            if msg.get("role") == "user" and msg.get("content"):
-                content = msg["content"]
-                if not content.startswith("/no-think"):
-                    msg["content"] = "/no-think\n" + content
-    
-    # 8. Forward request to LLM - use site_auth (LLM API key) for Authorization
-    forward_headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {llm_auth}",  # Use LLM API key
-    }
-    
     print(
-        f"[LLM] target={target_url} model={forward_body.get('model')} "
-        f"model_source={model_source}"
+        f"[CACHE MISS] key={cache_key} level={user_level} lane={active_route['lane']} "
+        f"lane_reason={active_route['lane_reason']} model={active_route['model']} "
+        f"model_source={active_route['model_source']}"
     )
+    print(f"[CACHE MISS] text preview: \"{user_msg}...\"")
+    print(f"[CACHE MISS] target: {active_route['target_url']}")
+
+    # 7. Forward request (with optional fallback from FAST -> default)
+    response: Optional[httpx.Response] = None
+    used_fallback = False
+    forward_body = build_forward_body(body, active_route["model"])
 
     try:
-        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-            response = await client.post(
-                target_url,
-                json=forward_body,
-                headers=forward_headers
+        response = await forward_to_llm(active_route, forward_body)
+    except HTTPException as first_call_error:
+        can_fallback = (
+            active_route["lane"] == "fast" and FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR
+        )
+        if not can_fallback:
+            raise first_call_error
+
+        used_fallback = True
+        active_route = default_route.copy()
+        body["model"] = active_route["model"]
+        fallback_cache_key = generate_cache_key(
+            body,
+            user_level,
+            active_route["model"],
+            active_route["lane"],
+        )
+        fallback_cached = get_cached_response(fallback_cache_key)
+        if fallback_cached and is_valid_response_content(fallback_cached):
+            print(
+                f"⚡ [CACHE HIT] key={fallback_cache_key[:16]}... level={user_level} "
+                f"lane={active_route['lane']} model={active_route['model']} "
+                f"model_source={active_route['model_source']} | Returning fallback cached response"
             )
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="LLM request timeout")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
-    
-    # 9. Process response
+            return fallback_cached
+
+        print("[LLM FALLBACK] primary route exception, retrying default lane")
+        forward_body = build_forward_body(body, active_route["model"])
+        response = await forward_to_llm(active_route, forward_body)
+        cache_key = fallback_cache_key
+
+    if (
+        response is not None
+        and response.status_code != 200
+        and active_route["lane"] == "fast"
+        and FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR
+    ):
+        log_llm_error(response, active_route)
+        used_fallback = True
+
+        active_route = default_route.copy()
+        body["model"] = active_route["model"]
+        fallback_cache_key = generate_cache_key(
+            body,
+            user_level,
+            active_route["model"],
+            active_route["lane"],
+        )
+        fallback_cached = get_cached_response(fallback_cache_key)
+        if fallback_cached and is_valid_response_content(fallback_cached):
+            print(
+                f"⚡ [CACHE HIT] key={fallback_cache_key[:16]}... level={user_level} "
+                f"lane={active_route['lane']} model={active_route['model']} "
+                f"model_source={active_route['model_source']} | Returning fallback cached response"
+            )
+            return fallback_cached
+
+        print("[LLM FALLBACK] primary route non-200, retrying default lane")
+        forward_body = build_forward_body(body, active_route["model"])
+        response = await forward_to_llm(active_route, forward_body)
+        cache_key = fallback_cache_key
+
+    if response is None:
+        raise HTTPException(status_code=500, detail="LLM request failed unexpectedly")
+
+    # 8. Process response
     if response.status_code == 200:
         try:
             response_data = response.json()
-            
+
             # Validate content is not empty before caching
             if is_valid_response_content(response_data):
                 # Cache successful response
@@ -499,16 +700,15 @@ async def chat_completions(request: Request):
                 log_request_response(body, response_data, cache_key)
             else:
                 print(f"[SKIP CACHE] Empty or invalid content detected, not caching")
-            
+
+            if used_fallback:
+                print("[LLM FALLBACK] completed with default lane response")
             return response_data
         except Exception:
             return Response(content=response.text, status_code=response.status_code)
     else:
         # Log LLM error details
-        print(f"[LLM ERROR] Status: {response.status_code}")
-        print(f"[LLM ERROR] Target: {target_url}")
-        print(f"[LLM ERROR] Auth used: Bearer {llm_auth[:20]}... (truncated)")
-        print(f"[LLM ERROR] Response: {response.text[:200]}")
+        log_llm_error(response, active_route)
         # Return error as-is
         return Response(
             content=response.text,

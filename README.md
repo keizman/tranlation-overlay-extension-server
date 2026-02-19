@@ -31,6 +31,7 @@ uvicorn main:app --reload --port 8000
 1. `POST /v1/chat/completions`
    - OpenAI-compatible passthrough + Redis cache
    - Includes cache key normalization (`normalize_for_cache`)
+   - Supports optional `FAST` lane for page-first request (`x_page_request_seq=1`)
    - Existing/original behavior is preserved
 
 2. `GET /health`
@@ -77,6 +78,12 @@ LLM_SITE_AUTH=
 DEFAULT_LLM_ENDPOINT=http://127.0.0.1:8317/v1/chat/completions
 DEFAULT_LLM_MODEL=gemini-2.5-flash-lite
 FORCE_DEFAULT_LLM_MODEL=true
+FAST_FIRST_REQUEST_ENABLED=false
+FAST_LLM_ENDPOINT=
+FAST_LLM_MODEL=mercury
+FAST_LLM_SITE_AUTHS=
+FAST_LLM_KEY_ROTATION=round_robin
+FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR=true
 DEFAULT_COMPAT_TARGET_LANGUAGE=zh-CN
 DICTIONARY_SERVER_BASE_URL=http://127.0.0.1:9000
 DICTIONARY_SERVER_BATCH_PATH=/api/v2/translate/batch
@@ -90,6 +97,12 @@ MAX_LOG_SIZE_MB=300
 `DEFAULT_LLM_MODEL` and `FORCE_DEFAULT_LLM_MODEL` control upstream model selection:
 - `FORCE_DEFAULT_LLM_MODEL=true` (default): always override request `model` with `DEFAULT_LLM_MODEL`.
 - `FORCE_DEFAULT_LLM_MODEL=false`: use request `model` when provided, fallback to `DEFAULT_LLM_MODEL`.
+
+FAST lane behavior (`FAST_*`):
+- Trigger condition: request body includes `x_page_request_seq=1` and `FAST_FIRST_REQUEST_ENABLED=true`.
+- Route override: `FAST_LLM_ENDPOINT`, `FAST_LLM_MODEL`, `FAST_LLM_SITE_AUTHS`.
+- Key rotation: `FAST_LLM_KEY_ROTATION=round_robin`.
+- Fallback: when fast lane fails and `FAST_LLM_FALLBACK_TO_DEFAULT_ON_ERROR=true`, server retries once with default lane.
 
 ## Real Request/Response Sample
 
